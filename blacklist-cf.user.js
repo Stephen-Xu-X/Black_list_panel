@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BLP-Black list Panel
 // @namespace    blacklist-panel-local
-// @version      4.1.2
+// @version      4.1.3
 // @description  登录后自动查询黑名单，支持 BOSS 直聘与前程无忧
 // @author       Stephen-Xu-X
 // @license      GPLv3
@@ -30,6 +30,7 @@
     title: 'Black list panel',
     helpText: '登录 · 绑卡 · 自动查询',
     versionNotes: [
+      'v4.1.3：提速查询队列与页面监听，降低 BOSS 与 51job 页面卡顿体感。',
       'v4.1.0：重写查询触发链路，修复登录后不扫描、绑卡后不扫描、重新打开页面不扫描。',
       'v4.1.0：重写面板事件与状态管理，修复输入框无法稳定输入、退出响应慢。'
     ]
@@ -52,10 +53,11 @@
   var dock = null;
   var currentView = 'login';
   var panelCollapsed = GM_getValue(CONFIG.panelCollapseStorageKey, false) === true;
+  var maxConcurrentQueries = 2;
   var autoQueryStarted = false;
   var debugLogs = [];
   var queryQueue = [];
-  var queryQueueRunning = false;
+  var activeQueryCount = 0;
   var visibleBossCompanies = {};
   var last51jobListSignature = '';
   var panelBusy = false;
@@ -963,7 +965,7 @@
 
   function stopQueryQueue(message, nextState) {
     autoQueryStarted = false;
-    queryQueueRunning = false;
+    activeQueryCount = 0;
     while (queryQueue.length) {
       var pendingJob = queryQueue.shift();
       pendingJob.reject(createStaleQueryError(message || 'Query queue stopped'));
@@ -1302,116 +1304,116 @@
   }
 
   function runQueryQueue() {
-    if (queryQueueRunning || !queryQueue.length) {
+    if (!queryQueue.length) {
       return;
     }
     if (!canAutoScan()) {
       stopQueryQueue('Auto scan stopped');
       return;
     }
-    queryQueueRunning = true;
-
-    var job = queryQueue.shift();
-    if (isBOSS && !isVisibleBossCompany(job.name)) {
-      queryQueueRunning = false;
-      job.reject(createStaleQueryError('Skipped stale boss query'));
-      if (queryQueue.length) {
-        setTimeout(runQueryQueue, 0);
-      }
-      return;
-    }
-    var state = loadState();
-    pushDebugLog('query:submit ' + job.name);
-    requestJson({
-      action: 'query',
-      session_token: state.sessionToken,
-      company_name: job.name
-    }).then(function (response) {
-      if (response.status !== 200) {
-        if (response.status === 403 && isSessionErrorMessage(response.data && response.data.error)) {
-          stopQueryQueue((response.data && response.data.error) || 'Session invalid');
-          clearState();
-        }
-        if (response.status === 403 && applyQueryAccessErrorState(response.data && response.data.error)) {
-          throw buildResponseError(response, 'Query blocked');
-        }
-        pushDebugLog('query:error ' + job.name + ' status=' + response.status + ' msg=' + ((response.data && response.data.error) || 'Query failed'));
-        throw buildResponseError(response, 'Query failed');
-      }
-      var result = {
-        found: !!response.data.found,
-        href: response.data.href || '',
-        searchUrl: response.data.searchUrl || '',
-        tags: Array.isArray(response.data.tags) ? response.data.tags : [],
-        expireTime: response.data.expire_time || '',
-        tokenBound: typeof response.data.token_bound === 'boolean' ? response.data.token_bound : !!state.tokenBound,
-        tokenStatus: response.data.token_status || state.tokenStatus || 'unbound',
-        contributionCount: Number(response.data.contribution_count || 0)
-      };
+    while (activeQueryCount < maxConcurrentQueries && queryQueue.length) {
+      var job = queryQueue.shift();
       if (isBOSS && !isVisibleBossCompany(job.name)) {
-        throw createStaleQueryError('Skipped stale boss result');
+        job.reject(createStaleQueryError('Skipped stale boss query'));
+        continue;
       }
-      if (!response.data.cache_hit && response.data.needs_fetch) {
-        return requestKjxb(job.name).then(function (liveResult) {
-          return requestJson({
-            action: 'report_query_result',
-            session_token: state.sessionToken,
-            company_name: job.name,
-            found: !!liveResult.found,
-            href: liveResult.href || '',
-            searchUrl: liveResult.searchUrl || '',
-            tags: Array.isArray(liveResult.tags) ? liveResult.tags : []
-          }).then(function (reportResponse) {
-            if (reportResponse.status === 200 && reportResponse.data && reportResponse.data.ok) {
-              liveResult.expireTime = reportResponse.data.expire_time || response.data.expire_time || '';
-              liveResult.tokenBound = typeof reportResponse.data.token_bound === 'boolean'
-                ? reportResponse.data.token_bound
-                : (typeof response.data.token_bound === 'boolean' ? response.data.token_bound : !!state.tokenBound);
-              liveResult.tokenStatus = reportResponse.data.token_status || response.data.token_status || state.tokenStatus || 'unbound';
-              liveResult.contributionCount = Number(reportResponse.data.contribution_count || 0);
-              pushDebugLog('query:report-ok ' + job.name + ' found=' + String(!!liveResult.found));
-              return liveResult;
-            }
 
-            pushDebugLog('query:report-warn ' + job.name + ' status=' + reportResponse.status);
-            liveResult.expireTime = response.data.expire_time || '';
-            liveResult.tokenBound = typeof response.data.token_bound === 'boolean' ? response.data.token_bound : !!state.tokenBound;
-            liveResult.tokenStatus = response.data.token_status || state.tokenStatus || 'unbound';
-            liveResult.contributionCount = Number(response.data.contribution_count || 0);
-            return liveResult;
-          }).catch(function (error) {
-            pushDebugLog('query:report-warn ' + job.name + ' ' + error.message);
-            liveResult.expireTime = response.data.expire_time || '';
-            liveResult.tokenBound = typeof response.data.token_bound === 'boolean' ? response.data.token_bound : !!state.tokenBound;
-            liveResult.tokenStatus = response.data.token_status || state.tokenStatus || 'unbound';
-            liveResult.contributionCount = Number(response.data.contribution_count || 0);
-            return liveResult;
-          });
+      activeQueryCount += 1;
+      (function (currentJob) {
+        var state = loadState();
+        pushDebugLog('query:submit ' + currentJob.name);
+        requestJson({
+          action: 'query',
+          session_token: state.sessionToken,
+          company_name: currentJob.name
+        }).then(function (response) {
+          if (response.status !== 200) {
+            if (response.status === 403 && isSessionErrorMessage(response.data && response.data.error)) {
+              stopQueryQueue((response.data && response.data.error) || 'Session invalid');
+              clearState();
+            }
+            if (response.status === 403 && applyQueryAccessErrorState(response.data && response.data.error)) {
+              throw buildResponseError(response, 'Query blocked');
+            }
+            pushDebugLog('query:error ' + currentJob.name + ' status=' + response.status + ' msg=' + ((response.data && response.data.error) || 'Query failed'));
+            throw buildResponseError(response, 'Query failed');
+          }
+          var result = {
+            found: !!response.data.found,
+            href: response.data.href || '',
+            searchUrl: response.data.searchUrl || '',
+            tags: Array.isArray(response.data.tags) ? response.data.tags : [],
+            expireTime: response.data.expire_time || '',
+            tokenBound: typeof response.data.token_bound === 'boolean' ? response.data.token_bound : !!state.tokenBound,
+            tokenStatus: response.data.token_status || state.tokenStatus || 'unbound',
+            contributionCount: Number(response.data.contribution_count || 0)
+          };
+          if (isBOSS && !isVisibleBossCompany(currentJob.name)) {
+            throw createStaleQueryError('Skipped stale boss result');
+          }
+          if (!response.data.cache_hit && response.data.needs_fetch) {
+            return requestKjxb(currentJob.name).then(function (liveResult) {
+              return requestJson({
+                action: 'report_query_result',
+                session_token: state.sessionToken,
+                company_name: currentJob.name,
+                found: !!liveResult.found,
+                href: liveResult.href || '',
+                searchUrl: liveResult.searchUrl || '',
+                tags: Array.isArray(liveResult.tags) ? liveResult.tags : []
+              }).then(function (reportResponse) {
+                if (reportResponse.status === 200 && reportResponse.data && reportResponse.data.ok) {
+                  liveResult.expireTime = reportResponse.data.expire_time || response.data.expire_time || '';
+                  liveResult.tokenBound = typeof reportResponse.data.token_bound === 'boolean'
+                    ? reportResponse.data.token_bound
+                    : (typeof response.data.token_bound === 'boolean' ? response.data.token_bound : !!state.tokenBound);
+                  liveResult.tokenStatus = reportResponse.data.token_status || response.data.token_status || state.tokenStatus || 'unbound';
+                  liveResult.contributionCount = Number(reportResponse.data.contribution_count || 0);
+                  pushDebugLog('query:report-ok ' + currentJob.name + ' found=' + String(!!liveResult.found));
+                  return liveResult;
+                }
+
+                pushDebugLog('query:report-warn ' + currentJob.name + ' status=' + reportResponse.status);
+                liveResult.expireTime = response.data.expire_time || '';
+                liveResult.tokenBound = typeof response.data.token_bound === 'boolean' ? response.data.token_bound : !!state.tokenBound;
+                liveResult.tokenStatus = response.data.token_status || state.tokenStatus || 'unbound';
+                liveResult.contributionCount = Number(response.data.contribution_count || 0);
+                return liveResult;
+              }).catch(function (error) {
+                pushDebugLog('query:report-warn ' + currentJob.name + ' ' + error.message);
+                liveResult.expireTime = response.data.expire_time || '';
+                liveResult.tokenBound = typeof response.data.token_bound === 'boolean' ? response.data.token_bound : !!state.tokenBound;
+                liveResult.tokenStatus = response.data.token_status || state.tokenStatus || 'unbound';
+                liveResult.contributionCount = Number(response.data.contribution_count || 0);
+                return liveResult;
+              });
+            });
+          }
+          cache[currentJob.name] = result;
+          return result;
+        }).then(function (result) {
+          cache[currentJob.name] = result;
+          var nextState = loadState();
+          if (nextState.status === 'active') {
+            nextState.expireTime = result.expireTime || nextState.expireTime;
+            nextState.tokenBound = typeof result.tokenBound === 'boolean' ? result.tokenBound : nextState.tokenBound;
+            nextState.tokenStatus = result.tokenStatus || nextState.tokenStatus || 'unbound';
+            nextState.contributionCount = Number(result.contributionCount || 0);
+            saveState(nextState, { skipRender: true });
+            refreshPanelChrome();
+          }
+          pushDebugLog('query:ok ' + currentJob.name + ' found=' + String(!!result.found));
+          currentJob.resolve(result);
+        }).catch(function (error) {
+          currentJob.reject(error);
+        }).finally(function () {
+          activeQueryCount = Math.max(0, activeQueryCount - 1);
+          if (queryQueue.length && canAutoScan()) {
+            setTimeout(runQueryQueue, 50);
+          }
         });
-      }
-      cache[job.name] = result;
-      return result;
-    }).then(function (result) {
-      cache[job.name] = result;
-      var nextState = loadState();
-      if (nextState.status === 'active') {
-        nextState.expireTime = result.expireTime || nextState.expireTime;
-        nextState.tokenBound = typeof result.tokenBound === 'boolean' ? result.tokenBound : nextState.tokenBound;
-        nextState.tokenStatus = result.tokenStatus || nextState.tokenStatus || 'unbound';
-        nextState.contributionCount = Number(result.contributionCount || 0);
-        saveState(nextState, { skipRender: true });
-        refreshPanelChrome();
-      }
-      pushDebugLog('query:ok ' + job.name + ' found=' + String(!!result.found));
-      job.resolve(result);
-    }).catch(function (error) {
-      job.reject(error);
-    }).finally(function () {
-      queryQueueRunning = false;
-      if (queryQueue.length && canAutoScan()) {
-        setTimeout(runQueryQueue, 120);
-      }
-    });
+      })(job);
+    }
   }
 
   function iconButtonStyle() {
@@ -2346,20 +2348,13 @@
     }
     var card = $(node).closest('li, .job-card-wrapper, .job-card-item, .job-card, .job-list-item, .job-card-left, .job-info');
     var tagList = card.find('.job-info > .tag-list, .tag-list').first();
+    if (!tagList.length || tagList.find('.kxb-tags-entry').length) {
+      return;
+    }
     var tagsText = result.tags.join('<span style="color:#2563eb"> / </span>');
     var hoverTitle = escapeHtml(result.tags.join(' | '));
-    if (tagList.length) {
-      if (tagList.find('.kxb-tags-entry').length) {
-        return;
-      }
-      var tagsHtml = $('<li class="kxb-tags-entry" title="' + hoverTitle + '"><span style="color:#ff3b30">' + tagsText + '</span></li>');
-      tagList.prepend(tagsHtml);
-      return;
-    }
-    if (card.find('.kxb-boss-tags-inline').length) {
-      return;
-    }
-    $(node).after('<div class="kxb-boss-tags-inline" title="' + hoverTitle + '" style="margin-top:6px;font-size:12px;line-height:1.4;color:#ef4444;">' + tagsText + '</div>');
+    var tagsHtml = $('<li class="kxb-tags-entry" title="' + hoverTitle + '"><span style="color:#ff3b30">' + tagsText + '</span></li>');
+    tagList.prepend(tagsHtml);
   }
 
   function insertGongsiTopResult(node, result) {
@@ -2446,6 +2441,12 @@
     } else {
       $node.after($html);
     }
+  }
+
+  function getBossObserveRoot() {
+    return document.querySelector(
+      '.job-list-box, .job-list, .rec-job-list, .search-job-result, .job-card-list, .page-job-wrapper, .job-detail, .chat-content, .company-content, .main, #wrap'
+    ) || document.body;
   }
 
   function startBossFeatures() {
@@ -2605,7 +2606,7 @@
     bossObserver = new MutationObserver(function () {
       scheduleBossScan();
     });
-    bossObserver.observe(document.documentElement || document.body, { childList: true, subtree: true });
+    bossObserver.observe(getBossObserveRoot(), { childList: true, subtree: true });
     scheduleBossScan(true);
     setTimeout(function () {
       scheduleBossScan(true);
