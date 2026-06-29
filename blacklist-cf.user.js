@@ -2346,13 +2346,20 @@
     }
     var card = $(node).closest('li, .job-card-wrapper, .job-card-item, .job-card, .job-list-item, .job-card-left, .job-info');
     var tagList = card.find('.job-info > .tag-list, .tag-list').first();
-    if (!tagList.length || tagList.find('.kxb-tags-entry').length) {
-      return;
-    }
     var tagsText = result.tags.join('<span style="color:#2563eb"> / </span>');
     var hoverTitle = escapeHtml(result.tags.join(' | '));
-    var tagsHtml = $('<li class="kxb-tags-entry" title="' + hoverTitle + '"><span style="color:#ff3b30">' + tagsText + '</span></li>');
-    tagList.prepend(tagsHtml);
+    if (tagList.length) {
+      if (tagList.find('.kxb-tags-entry').length) {
+        return;
+      }
+      var tagsHtml = $('<li class="kxb-tags-entry" title="' + hoverTitle + '"><span style="color:#ff3b30">' + tagsText + '</span></li>');
+      tagList.prepend(tagsHtml);
+      return;
+    }
+    if (card.find('.kxb-boss-tags-inline').length) {
+      return;
+    }
+    $(node).after('<div class="kxb-boss-tags-inline" title="' + hoverTitle + '" style="margin-top:6px;font-size:12px;line-height:1.4;color:#ef4444;">' + tagsText + '</div>');
   }
 
   function insertGongsiTopResult(node, result) {
